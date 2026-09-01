@@ -7,6 +7,7 @@ use App\Models\Task;
 use App\Models\TaskRun;
 use Illuminate\Support\Carbon;
 use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Str;
 use Throwable;
 
 /**
@@ -94,8 +95,10 @@ class JobQueueService
             $taskRow = Task::query()
                 ->whereKey($taskId)
                 ->lockForUpdate()
-                ->first(['id', 'max_retry_count']);
-            if (! $taskRow) {
+                ->first(['id', 'status', 'schedule_enabled', 'max_retry_count']);
+            if (! $taskRow
+                || ($taskRow->status ?? 'paused') !== 'active'
+                || (int) ($taskRow->schedule_enabled ?? 1) !== 1) {
                 return null;
             }
 
@@ -123,7 +126,7 @@ class JobQueueService
                     'max_attempts' => $maxAttempts,
                     'available_at' => $availableAtValue->toDateTimeString(),
                 ],
-                'started_at' => $availableAtValue,
+                'started_at' => null,
                 'finished_at' => null,
             ]);
         });
@@ -132,7 +135,8 @@ class JobQueueService
         }
 
         // 完全使用 Laravel Queue 执行。
-        $this->dispatchLaravelQueueJob((int) $run->id, $run->started_at);
+        $runMeta = $this->normalizeMeta($run->meta);
+        $this->dispatchLaravelQueueJob((int) $run->id, $runMeta['available_at'] ?? null);
         $this->broadcastOverviewUpdate();
 
         return (int) $run->id;
@@ -230,22 +234,44 @@ class JobQueueService
      */
     public function completeJob(int $jobId, int $taskId, ?int $articleId, int $durationMs, array $meta = []): void
     {
-        TaskRun::query()->whereKey($jobId)->update([
-            'status' => 'completed',
-            'finished_at' => now(),
-            'article_id' => $articleId,
-            'duration_ms' => $durationMs,
-            'meta' => $meta,
-            'error_message' => '',
-        ]);
+        $completed = DB::transaction(function () use ($jobId, $taskId, $articleId, $durationMs, $meta): bool {
+            $task = Task::query()
+                ->whereKey($taskId)
+                ->lockForUpdate()
+                ->first(['id']);
+            if (! $task) {
+                return false;
+            }
 
-        Task::query()->whereKey($taskId)->update([
-            'last_run_at' => now(),
-            'last_success_at' => now(),
-            'last_error_at' => null,
-            'last_error_message' => '',
-            'updated_at' => now(),
-        ]);
+            $affected = TaskRun::query()
+                ->whereKey($jobId)
+                ->where('task_id', $taskId)
+                ->where('status', 'running')
+                ->update([
+                    'status' => 'completed',
+                    'finished_at' => now(),
+                    'article_id' => $articleId,
+                    'duration_ms' => $durationMs,
+                    'meta' => $meta,
+                    'error_message' => '',
+                ]);
+            if ($affected !== 1) {
+                return false;
+            }
+
+            Task::query()->whereKey($taskId)->update([
+                'last_run_at' => now(),
+                'last_success_at' => now(),
+                'last_error_at' => null,
+                'last_error_message' => '',
+                'updated_at' => now(),
+            ]);
+
+            return true;
+        });
+        if (! $completed) {
+            return;
+        }
 
         $this->broadcastOverviewUpdate();
         $this->enqueueFollowUpGenerationIfNeeded($taskId, $meta);
@@ -260,44 +286,140 @@ class JobQueueService
      */
     public function failJob(int $jobId, int $taskId, string $errorMessage, int $durationMs, int $retryDelaySeconds = 60): void
     {
-        $run = TaskRun::query()->whereKey($jobId)->first();
-        if (! $run) {
+        $result = DB::transaction(function () use ($jobId, $taskId, $errorMessage, $durationMs, $retryDelaySeconds): array {
+            $task = Task::query()
+                ->whereKey($taskId)
+                ->lockForUpdate()
+                ->first(['id', 'status', 'schedule_enabled']);
+            $run = TaskRun::query()
+                ->whereKey($jobId)
+                ->where('task_id', $taskId)
+                ->where('status', 'running')
+                ->lockForUpdate()
+                ->first();
+            if (! $run) {
+                return ['changed' => false, 'retry' => false, 'available_at' => null];
+            }
+
+            if (! $task || ($task->status ?? 'paused') !== 'active' || (int) ($task->schedule_enabled ?? 1) !== 1) {
+                $run->update([
+                    'status' => 'cancelled',
+                    'finished_at' => now(),
+                    'error_message' => '任务已删除或停用',
+                    'duration_ms' => $durationMs,
+                ]);
+
+                return ['changed' => true, 'retry' => false, 'available_at' => null];
+            }
+
+            $runMeta = $this->normalizeMeta($run->meta);
+            $attemptCount = (int) ($runMeta['attempt_count'] ?? 0) + 1;
+            $maxAttempts = max(1, (int) ($runMeta['max_attempts'] ?? 3));
+            $shouldRetry = $attemptCount < $maxAttempts;
+            $nextAvailableAt = now()->addSeconds(max(1, $retryDelaySeconds));
+
+            $newMeta = array_merge($runMeta, [
+                'attempt_count' => $attemptCount,
+                'max_attempts' => $maxAttempts,
+                'last_error' => $errorMessage,
+                'available_at' => $shouldRetry ? $nextAvailableAt->toDateTimeString() : ($runMeta['available_at'] ?? ''),
+            ]);
+
+            $run->update([
+                'status' => $shouldRetry ? 'pending' : 'failed',
+                'error_message' => $errorMessage,
+                'duration_ms' => $durationMs,
+                'finished_at' => $shouldRetry ? null : now(),
+                'meta' => $newMeta,
+            ]);
+
+            Task::query()->whereKey($taskId)->update([
+                'last_run_at' => now(),
+                'last_error_at' => now(),
+                'last_error_message' => $errorMessage,
+                'updated_at' => now(),
+            ]);
+
+            return ['changed' => true, 'retry' => $shouldRetry, 'available_at' => $nextAvailableAt];
+        });
+
+        if (! $result['changed']) {
             return;
         }
 
-        $runMeta = $this->normalizeMeta($run->meta);
-        $attemptCount = (int) ($runMeta['attempt_count'] ?? 0) + 1;
-        $maxAttempts = max(1, (int) ($runMeta['max_attempts'] ?? 3));
-        $shouldRetry = $attemptCount < $maxAttempts;
-        $nextAvailableAt = now()->addSeconds(max(1, $retryDelaySeconds));
-
-        $newMeta = array_merge($runMeta, [
-            'attempt_count' => $attemptCount,
-            'max_attempts' => $maxAttempts,
-            'last_error' => $errorMessage,
-            'available_at' => $shouldRetry ? $nextAvailableAt->toDateTimeString() : ($runMeta['available_at'] ?? ''),
-        ]);
-
-        TaskRun::query()->whereKey($jobId)->update([
-            'status' => $shouldRetry ? 'pending' : 'failed',
-            'error_message' => $errorMessage,
-            'duration_ms' => $durationMs,
-            'finished_at' => $shouldRetry ? null : now(),
-            'meta' => $newMeta,
-        ]);
-
-        Task::query()->whereKey($taskId)->update([
-            'last_run_at' => now(),
-            'last_error_at' => now(),
-            'last_error_message' => $errorMessage,
-            'updated_at' => now(),
-        ]);
-
-        if ($shouldRetry) {
-            $this->dispatchLaravelQueueJob($jobId, $nextAvailableAt);
+        if ($result['retry'] && $result['available_at'] instanceof Carbon) {
+            $this->dispatchLaravelQueueJob($jobId, $result['available_at']);
         }
 
         $this->broadcastOverviewUpdate();
+    }
+
+    /**
+     * 将不可重试的标题库配置错误标记为终态，并暂停任务阻止后续无效调度。
+     *
+     * @param  array<string,mixed>  $details
+     */
+    public function failForTaskConfiguration(
+        int $jobId,
+        int $taskId,
+        string $errorMessage,
+        int $durationMs,
+        array $details = [],
+    ): void {
+        $changed = DB::transaction(function () use ($jobId, $taskId, $errorMessage, $durationMs, $details): bool {
+            $task = Task::query()
+                ->whereKey($taskId)
+                ->lockForUpdate()
+                ->first(['id']);
+            $run = TaskRun::query()
+                ->whereKey($jobId)
+                ->where('task_id', $taskId)
+                ->lockForUpdate()
+                ->first();
+            if (! $task || ! $run || $run->status !== 'running') {
+                return false;
+            }
+
+            $meta = $this->normalizeMeta($run->meta);
+            $meta['attempt_count'] = (int) ($meta['attempt_count'] ?? 0) + 1;
+            $meta['retryable'] = false;
+            $meta['failure_class'] = 'configuration';
+            $meta['error_code'] = 'task_title_library_not_ready';
+            $meta['last_error'] = $errorMessage;
+            $meta['title_readiness'] = $details;
+
+            TaskRun::query()->whereKey($jobId)->update([
+                'status' => 'failed',
+                'error_message' => $errorMessage,
+                'duration_ms' => $durationMs,
+                'finished_at' => now(),
+                'meta' => $meta,
+            ]);
+            TaskRun::query()
+                ->where('task_id', $taskId)
+                ->whereKeyNot($jobId)
+                ->where('status', 'pending')
+                ->update([
+                    'status' => 'cancelled',
+                    'finished_at' => now(),
+                    'error_message' => '任务因标题库配置问题自动暂停',
+                ]);
+            Task::query()->whereKey($taskId)->update([
+                'status' => 'paused',
+                'schedule_enabled' => 0,
+                'next_run_at' => null,
+                'last_run_at' => now(),
+                'last_error_at' => now(),
+                'last_error_message' => $errorMessage,
+                'updated_at' => now(),
+            ]);
+
+            return true;
+        });
+
+        if ($changed) {
+            $this->broadcastOverviewUpdate();
+        }
     }
 
     /**
@@ -305,12 +427,19 @@ class JobQueueService
      */
     public function cancelJob(int $jobId, int $taskId, string $reason = '管理员手动停止'): void
     {
-        TaskRun::query()->whereKey($jobId)->update([
-            'status' => 'cancelled',
-            'finished_at' => now(),
-            'error_message' => $reason,
-            'duration_ms' => 0,
-        ]);
+        $cancelled = TaskRun::query()
+            ->whereKey($jobId)
+            ->where('task_id', $taskId)
+            ->where('status', 'running')
+            ->update([
+                'status' => 'cancelled',
+                'finished_at' => now(),
+                'error_message' => $reason,
+                'duration_ms' => 0,
+            ]);
+        if ($cancelled !== 1) {
+            return;
+        }
 
         Task::query()->whereKey($taskId)->update([
             'last_run_at' => now(),
@@ -323,62 +452,92 @@ class JobQueueService
     }
 
     /**
-     * 恢复超时未完成的 running 记录。
+     * 恢复失去队列消息的超时记录。
      *
-     * 兜底场景：worker 异常退出、超时杀进程、心跳抛错等导致 `handle()` 未回写完成态。
-     * 处理方式：将仍卡在 running 的记录回退为 pending，并立即重新投递队列，避免「面板显示待执行但 Redis 里已无对应 Job」。
+     * - running：worker 异常退出、超时杀进程、心跳抛错等导致 `handle()` 未回写完成态；
+     * - pending：数据库已提交，但 after-commit 队列发布失败或 Redis 消息丢失。
      *
-     * @return int 成功回退并重新投递的记录数
+     * @return int 成功重新投递的记录数
      */
-    public function recoverStaleJobs(int $timeoutSeconds = 600): int
+    public function recoverStaleJobs(int $timeoutSeconds = 600, int $limit = 100): int
     {
         $threshold = now()->subSeconds(max(60, $timeoutSeconds));
+        $limit = max(1, min(500, $limit));
+        $recovered = $this->recoverStalePendingJobs($threshold, $limit);
+        $remainingLimit = max(0, $limit - $recovered);
+        if ($remainingLimit === 0) {
+            return $recovered;
+        }
+
         $candidateIds = TaskRun::query()
             ->where('status', 'running')
             ->where('started_at', '<', $threshold)
             ->orderBy('id')
+            ->limit($remainingLimit)
             ->pluck('id')
             ->map(static fn (mixed $id): int => (int) $id)
             ->all();
 
-        $recovered = 0;
         foreach ($candidateIds as $jobId) {
-            /** @var TaskRun|null $run */
-            $run = TaskRun::query()
-                ->with('task:id,status,schedule_enabled')
-                ->whereKey($jobId)
-                ->where('status', 'running')
-                ->first();
+            $dispatchToken = (string) Str::uuid();
+            try {
+                $redispatched = DB::transaction(function () use ($jobId, $threshold, $dispatchToken): bool {
+                    $run = TaskRun::query()
+                        ->with('task:id,status,schedule_enabled')
+                        ->whereKey($jobId)
+                        ->where('status', 'running')
+                        ->where('started_at', '<', $threshold)
+                        ->lockForUpdate()
+                        ->first();
+                    if (! $run) {
+                        return false;
+                    }
 
-            if (! $run) {
+                    $task = $run->task;
+                    if (! $task || ($task->status ?? 'paused') !== 'active' || (int) ($task->schedule_enabled ?? 1) !== 1) {
+                        TaskRun::query()
+                            ->whereKey($jobId)
+                            ->where('status', 'running')
+                            ->where('started_at', '<', $threshold)
+                            ->update([
+                                'status' => 'cancelled',
+                                'finished_at' => now(),
+                                'error_message' => '任务未启用，已取消超时执行记录',
+                            ]);
+
+                        return false;
+                    }
+
+                    $meta = $this->normalizeMeta($run->meta);
+                    $affected = TaskRun::query()
+                        ->whereKey($jobId)
+                        ->where('status', 'running')
+                        ->where('started_at', '<', $threshold)
+                        ->update([
+                            'status' => 'pending',
+                            'finished_at' => null,
+                            'error_message' => '',
+                            'meta' => array_merge($meta, [
+                                'recovery_dispatched_at' => now()->toDateTimeString(),
+                                'recovery_dispatch_token' => $dispatchToken,
+                            ]),
+                        ]);
+                    if ($affected !== 1) {
+                        return false;
+                    }
+
+                    $this->dispatchLaravelQueueJob($jobId);
+
+                    return true;
+                });
+            } catch (Throwable $exception) {
+                $this->clearFailedPendingRecoveryAttempt($jobId, $dispatchToken);
+                report($exception);
+
                 continue;
             }
 
-            $task = $run->task;
-            if (! $task || ($task->status ?? 'paused') !== 'active' || (int) ($task->schedule_enabled ?? 1) !== 1) {
-                TaskRun::query()
-                    ->whereKey($jobId)
-                    ->where('status', 'running')
-                    ->update([
-                        'status' => 'cancelled',
-                        'finished_at' => now(),
-                        'error_message' => '任务未启用，已取消超时执行记录',
-                    ]);
-
-                continue;
-            }
-
-            $affected = TaskRun::query()
-                ->whereKey($jobId)
-                ->where('status', 'running')
-                ->update([
-                    'status' => 'pending',
-                    'finished_at' => null,
-                    'error_message' => '',
-                ]);
-
-            if ($affected === 1) {
-                $this->dispatchLaravelQueueJob($jobId);
+            if ($redispatched) {
                 $recovered++;
             }
         }
@@ -386,26 +545,159 @@ class JobQueueService
         return $recovered;
     }
 
+    private function recoverStalePendingJobs(Carbon $threshold, int $limit): int
+    {
+        $candidateIds = TaskRun::query()
+            ->where('status', 'pending')
+            ->where('created_at', '<', $threshold)
+            ->orderBy('id')
+            ->limit($limit)
+            ->pluck('id')
+            ->map(static fn (mixed $id): int => (int) $id)
+            ->all();
+
+        $recovered = 0;
+        foreach ($candidateIds as $jobId) {
+            $dispatchToken = (string) Str::uuid();
+            try {
+                $redispatched = DB::transaction(function () use ($jobId, $threshold, $dispatchToken): bool {
+                    $run = TaskRun::query()
+                        ->with('task:id,status,schedule_enabled')
+                        ->whereKey($jobId)
+                        ->where('status', 'pending')
+                        ->lockForUpdate()
+                        ->first();
+                    if (! $run) {
+                        return false;
+                    }
+
+                    $task = $run->task;
+                    if (! $task || ($task->status ?? 'paused') !== 'active' || (int) ($task->schedule_enabled ?? 1) !== 1) {
+                        TaskRun::query()
+                            ->whereKey($jobId)
+                            ->where('status', 'pending')
+                            ->update([
+                                'status' => 'cancelled',
+                                'finished_at' => now(),
+                                'error_message' => '任务未启用，已取消待执行记录',
+                            ]);
+
+                        return false;
+                    }
+
+                    $meta = $this->normalizeMeta($run->meta);
+                    $availableAt = $this->parseMetaDate($meta['available_at'] ?? null);
+                    if ($availableAt instanceof Carbon && $availableAt->greaterThan(now())) {
+                        return false;
+                    }
+
+                    $staleReference = collect([
+                        $run->created_at,
+                        $availableAt,
+                        $this->parseMetaDate($meta['recovery_dispatched_at'] ?? null),
+                    ])->filter()->max();
+                    if (! $staleReference instanceof Carbon || ! $staleReference->lessThan($threshold)) {
+                        return false;
+                    }
+
+                    $affected = TaskRun::query()
+                        ->whereKey($jobId)
+                        ->where('status', 'pending')
+                        ->update([
+                            'meta' => array_merge($meta, [
+                                'recovery_dispatched_at' => now()->toDateTimeString(),
+                                'recovery_dispatch_token' => $dispatchToken,
+                            ]),
+                        ]);
+                    if ($affected !== 1) {
+                        return false;
+                    }
+
+                    $this->dispatchLaravelQueueJob($jobId);
+
+                    return true;
+                });
+            } catch (Throwable $exception) {
+                $this->clearFailedPendingRecoveryAttempt($jobId, $dispatchToken);
+                report($exception);
+
+                continue;
+            }
+
+            if ($redispatched) {
+                $recovered++;
+            }
+        }
+
+        return $recovered;
+    }
+
+    private function clearFailedPendingRecoveryAttempt(int $jobId, string $dispatchToken): void
+    {
+        try {
+            DB::transaction(function () use ($jobId, $dispatchToken): void {
+                $run = TaskRun::query()
+                    ->whereKey($jobId)
+                    ->where('status', 'pending')
+                    ->lockForUpdate()
+                    ->first();
+                if (! $run) {
+                    return;
+                }
+
+                $meta = $this->normalizeMeta($run->meta);
+                if (! hash_equals($dispatchToken, (string) ($meta['recovery_dispatch_token'] ?? ''))) {
+                    return;
+                }
+
+                unset($meta['recovery_dispatched_at'], $meta['recovery_dispatch_token']);
+                TaskRun::query()
+                    ->whereKey($jobId)
+                    ->where('status', 'pending')
+                    ->update(['meta' => $meta]);
+            });
+        } catch (Throwable $exception) {
+            report($exception);
+        }
+    }
+
+    private function parseMetaDate(mixed $value): ?Carbon
+    {
+        if (! is_string($value) || trim($value) === '') {
+            return null;
+        }
+
+        try {
+            return Carbon::parse($value);
+        } catch (Throwable) {
+            return null;
+        }
+    }
+
     /**
      * 将 task_runs 执行记录投递到 Laravel 队列。
      */
     private function dispatchLaravelQueueJob(int $taskRunId, mixed $availableAt = null): void
     {
-        $dispatch = ProcessGeoFlowTaskJob::dispatch($taskRunId)->onQueue('geoflow');
+        DB::afterCommit(function () use ($taskRunId, $availableAt): void {
+            $dispatch = ProcessGeoFlowTaskJob::dispatch($taskRunId)
+                ->onQueue('geoflow')
+                ->afterCommit();
 
-        if ($availableAt instanceof Carbon) {
-            $dispatch->delay($availableAt);
+            if ($availableAt instanceof Carbon) {
+                $dispatch->delay($availableAt);
 
-            return;
-        }
-
-        if (is_string($availableAt) && trim($availableAt) !== '') {
-            try {
-                $dispatch->delay(Carbon::parse($availableAt));
-            } catch (Throwable) {
-                // ignore invalid datetime
+                return;
             }
-        }
+
+            if (is_string($availableAt) && trim($availableAt) !== '') {
+                try {
+                    $dispatch->delay(Carbon::parse($availableAt));
+                } catch (Throwable) {
+                    // ignore invalid datetime
+                }
+            }
+        });
     }
 
     /**
@@ -478,10 +770,12 @@ class JobQueueService
      */
     private function broadcastOverviewUpdate(): void
     {
-        try {
-            app(TaskRealtimeBroadcastService::class)->broadcastOverview();
-        } catch (Throwable) {
-            // ignore
-        }
+        DB::afterCommit(function (): void {
+            try {
+                app(TaskRealtimeBroadcastService::class)->broadcastOverview();
+            } catch (Throwable) {
+                // ignore
+            }
+        });
     }
 }
